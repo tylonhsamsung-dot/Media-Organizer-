@@ -50,7 +50,8 @@ QUALITY_TAG = re.compile(
     re.I)
 YEAR_PAT    = re.compile(r'\b(19[5-9]\d|20[0-3]\d)\b')
 CONFIG_PATH = pathlib.Path.home() / ".media_organizer_config.json"
-TMDB_KEY    = ""   # paste your free key from themoviedb.org here
+TMDB_KEY     = ""   # paste your free key from themoviedb.org here
+TMDB_ENABLED = False  # only True after user clicks "Update via TMDB" button
 
 BG     = "#1a1a2e"
 PANEL  = "#16213e"
@@ -235,8 +236,8 @@ def clean_movie_name(filename):
     return title, year
 
 def tmdb_lookup(title, year=None):
-    """TMDB lookup — only called in a background thread, never on startup."""
-    if not REQUESTS_OK or not TMDB_KEY:
+    """TMDB lookup — only runs when user explicitly enables it via button."""
+    if not REQUESTS_OK or not TMDB_KEY or not TMDB_ENABLED:
         return None
     try:
         params = {"api_key": TMDB_KEY, "query": title, "language": "en-US"}
@@ -329,6 +330,86 @@ def route_folder(folderpath, series_dir, movie_dir, s_log, m_log):
         sort_movie_folder(folderpath, movie_dir, m_log)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SCAN OUTPUT FOLDERS (rename/reorganise files already in output dirs)
+# ═══════════════════════════════════════════════════════════════════════════════
+def scan_series_output(series_dir, log):
+    """Walk the series output folder and fix any incorrectly named episodes."""
+    if not series_dir or not os.path.isdir(series_dir):
+        log("⚠ Series output folder not set or doesn't exist."); return
+    count = 0
+    for show in os.listdir(series_dir):
+        show_path = os.path.join(series_dir, show)
+        if not os.path.isdir(show_path): continue
+        for season_folder in os.listdir(show_path):
+            season_path = os.path.join(show_path, season_folder)
+            if not os.path.isdir(season_path): continue
+            # Extract season number from folder name
+            sm = re.match(r'[Ss]eason\s*(\d+)', season_folder)
+            if not sm: continue
+            snum = int(sm.group(1))
+            for fname in os.listdir(season_path):
+                fpath = os.path.join(season_path, fname)
+                if not os.path.isfile(fpath): continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in VIDEO_EXT: continue
+                # Check if already correctly named (e.g. 101.mkv)
+                if re.match(r'^\d{3,4}' + re.escape(ext) + '$', fname): continue
+                # Try to parse episode number from filename
+                result = parse_episode(fname) or parse_episode(f"{show} {fname}")
+                if result:
+                    _, _, ep = result
+                    new_name = f"{snum}{ep:02d}{ext}"
+                    new_path = os.path.join(season_path, new_name)
+                    if new_path != fpath and not os.path.exists(new_path):
+                        os.rename(fpath, new_path)
+                        log(f"✏️  {show}/Season {snum}/{fname}  →  {new_name}")
+                        count += 1
+    log(f"── Series scan done ({count} file(s) renamed) ──\n")
+
+def scan_movies_output(movie_dir, log):
+    """Walk the movies output folder and clean up any poorly named files."""
+    if not movie_dir or not os.path.isdir(movie_dir):
+        log("⚠ Movies output folder not set or doesn't exist."); return
+    count = 0
+    for fname in os.listdir(movie_dir):
+        fpath = os.path.join(movie_dir, fname)
+        # Flatten subfolders — move video files up to root
+        if os.path.isdir(fpath):
+            for sub in os.listdir(fpath):
+                sub_path = os.path.join(fpath, sub)
+                ext = os.path.splitext(sub)[1].lower()
+                if os.path.isfile(sub_path) and ext in VIDEO_EXT:
+                    dest = os.path.join(movie_dir, sub)
+                    if not os.path.exists(dest):
+                        shutil.move(sub_path, dest)
+                        log(f"📁 Moved out of subfolder: {sub}")
+                        count += 1
+            try:
+                if not os.listdir(fpath): os.rmdir(fpath)
+            except: pass
+            continue
+        if not os.path.isfile(fpath): continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in VIDEO_EXT: continue
+        # Check if file has quality tags still in the name
+        if not QUALITY_TAG.search(fname): continue
+        raw_title, raw_year = clean_movie_name(fname)
+        # Try TMDB if enabled, otherwise just clean the name
+        tmdb = tmdb_lookup(raw_title, raw_year)
+        if tmdb:
+            title, year = tmdb
+            log(f"🌐 TMDB: '{raw_title}' → '{title}' ({year})")
+        else:
+            title, year = raw_title, raw_year
+        new_name = build_movie_filename(title, year, ext)
+        new_path = os.path.join(movie_dir, new_name)
+        if new_name != fname and not os.path.exists(new_path):
+            os.rename(fpath, new_path)
+            log(f"✏️  {fname}  →  {new_name}")
+            count += 1
+    log(f"── Movies scan done ({count} file(s) renamed) ──\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  WATCHDOG HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 if WATCHDOG_OK:
@@ -390,12 +471,28 @@ class App:
         self.series_var = self._folder_row("Series Output", "(organised TV library)",     self._browse("series_var"))
         self.movie_var  = self._folder_row("Movies Output", "(organised movie library)",  self._browse("movie_var"))
 
-        # Buttons
-        btn_row = tk.Frame(self.root, bg=BG); btn_row.pack(fill="x", padx=20, pady=4)
-        tk.Button(btn_row, text="▶  Sort files already in Watch Folder",
+        # ── Row 1: Watch folder actions ──
+        btn_row = tk.Frame(self.root, bg=BG); btn_row.pack(fill="x", padx=20, pady=(4,2))
+        tk.Button(btn_row, text="▶  Sort files in Watch Folder",
                   command=self._scan, bg=PANEL2, fg=MUTED, relief="flat",
                   font=UI, cursor="hand2", padx=10, pady=4).pack(side="left")
 
+        # ── Row 2: Output folder actions ──
+        out_row = tk.Frame(self.root, bg=BG); out_row.pack(fill="x", padx=20, pady=(0,2))
+        tk.Button(out_row, text="🔁  Scan & Fix Series Output Folder",
+                  command=self._scan_series_output, bg=PANEL2, fg=MUTED, relief="flat",
+                  font=UI, cursor="hand2", padx=10, pady=4).pack(side="left", padx=(0,8))
+        tk.Button(out_row, text="🔁  Scan & Fix Movies Output Folder",
+                  command=self._scan_movies_output, bg=PANEL2, fg=MUTED, relief="flat",
+                  font=UI, cursor="hand2", padx=10, pady=4).pack(side="left", padx=(0,8))
+        self.tmdb_btn = tk.Button(out_row, text="🌐  Update via TMDB",
+                  command=self._toggle_tmdb, bg=PANEL2, fg=MUTED, relief="flat",
+                  font=UI, cursor="hand2", padx=10, pady=4)
+        self.tmdb_btn.pack(side="left")
+        self.tmdb_lbl = tk.Label(out_row, text="● TMDB off", font=UI, bg=BG, fg=MUTED)
+        self.tmdb_lbl.pack(side="left", padx=8)
+
+        # ── Row 3: Start/stop watcher ──
         ctrl = tk.Frame(self.root, bg=BG); ctrl.pack(fill="x", padx=20, pady=2)
         self.toggle_btn = tk.Button(ctrl, text="▶  Start Watching",
                                     command=self._toggle,
@@ -480,6 +577,42 @@ class App:
         self.lbl_mov.configure( text=f"Movies sorted: {STATS.movies}")
         self.lbl_dupe.configure(text=f"Duplicates: {STATS.dupes}")
         self.root.after(3000, self._refresh_stats)
+
+    def _toggle_tmdb(self):
+        global TMDB_ENABLED
+        if not TMDB_KEY:
+            messagebox.showwarning("No TMDB Key",
+                "Please add your TMDB API key to the top of the script first.")
+            return
+        TMDB_ENABLED = not TMDB_ENABLED
+        if TMDB_ENABLED:
+            self.tmdb_btn.configure(bg="#2d6a4f", fg="white")
+            self.tmdb_lbl.configure(text="🟢 TMDB on", fg=GREEN)
+            self.m_log("🌐 TMDB lookups enabled — movies will be matched online.\n")
+        else:
+            self.tmdb_btn.configure(bg=PANEL2, fg=MUTED)
+            self.tmdb_lbl.configure(text="● TMDB off", fg=MUTED)
+            self.m_log("📴 TMDB lookups disabled.\n")
+
+    def _scan_series_output(self):
+        series = self.series_var.get().strip()
+        if not series:
+            messagebox.showwarning("Missing folder", "Please set the Series Output folder first.")
+            return
+        def _run():
+            self.s_log("── Scanning Series Output Folder ──")
+            scan_series_output(series, self.s_log)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _scan_movies_output(self):
+        movies = self.movie_var.get().strip()
+        if not movies:
+            messagebox.showwarning("Missing folder", "Please set the Movies Output folder first.")
+            return
+        def _run():
+            self.m_log("── Scanning Movies Output Folder ──")
+            scan_movies_output(movies, self.m_log)
+        threading.Thread(target=_run, daemon=True).start()
 
     def _toggle(self):
         if self.running: self._stop()
