@@ -333,81 +333,185 @@ def route_folder(folderpath, series_dir, movie_dir, s_log, m_log):
 #  SCAN OUTPUT FOLDERS (rename/reorganise files already in output dirs)
 # ═══════════════════════════════════════════════════════════════════════════════
 def scan_series_output(series_dir, log):
-    """Walk the series output folder and fix any incorrectly named episodes."""
+    """Walk series output folder. Handles:
+    - Episodes already in Show/Season X/ folders — rename to 101 format
+    - Episode files sitting loose directly in a show folder — sort into season subfolders
+    - Nested subfolders inside season folders — flatten and rename
+    """
     if not series_dir or not os.path.isdir(series_dir):
         log("⚠ Series output folder not set or doesn't exist."); return
     count = 0
-    for show in os.listdir(series_dir):
+
+    for show in sorted(os.listdir(series_dir)):
         show_path = os.path.join(series_dir, show)
         if not os.path.isdir(show_path): continue
-        for season_folder in os.listdir(show_path):
-            season_path = os.path.join(show_path, season_folder)
-            if not os.path.isdir(season_path): continue
-            # Extract season number from folder name
-            sm = re.match(r'[Ss]eason\s*(\d+)', season_folder)
-            if not sm: continue
-            snum = int(sm.group(1))
-            for fname in os.listdir(season_path):
-                fpath = os.path.join(season_path, fname)
-                if not os.path.isfile(fpath): continue
-                ext = os.path.splitext(fname)[1].lower()
+
+        for item in list(os.listdir(show_path)):
+            item_path = os.path.join(show_path, item)
+
+            # ── Case 1: Season subfolder exists ──────────────────────────────
+            if os.path.isdir(item_path):
+                sm = re.match(r'[Ss]eason\s*(\d+)', item)
+                if not sm:
+                    # Unknown subfolder — try to process files inside it anyway
+                    f_show, f_season = parse_folder_name(item)
+                    snum = f_season or 1
+                else:
+                    snum = int(sm.group(1))
+                season_path = item_path
+
+                # Flatten any nested subfolders inside the season folder
+                for sub in list(os.listdir(season_path)):
+                    sub_path = os.path.join(season_path, sub)
+                    if os.path.isdir(sub_path):
+                        for nested in os.listdir(sub_path):
+                            nested_path = os.path.join(sub_path, nested)
+                            ext2 = os.path.splitext(nested)[1].lower()
+                            if os.path.isfile(nested_path) and ext2 in VIDEO_EXT:
+                                dest = os.path.join(season_path, nested)
+                                if not os.path.exists(dest):
+                                    shutil.move(nested_path, dest)
+                                    log(f"📁 Flattened: {show}/Season {snum}/{nested}")
+                        try:
+                            if not os.listdir(sub_path): os.rmdir(sub_path)
+                        except: pass
+
+                # Now rename files in the season folder
+                for fname in sorted(os.listdir(season_path)):
+                    fpath = os.path.join(season_path, fname)
+                    if not os.path.isfile(fpath): continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in VIDEO_EXT: continue
+                    # Already correctly named?
+                    if re.match(r'^\d{3,4}' + re.escape(ext) + '$', fname): continue
+                    result = parse_episode(fname) or parse_episode(f"{show} {fname}")
+                    if result:
+                        _, parsed_season, ep = result
+                        s = parsed_season if parsed_season else snum
+                        new_name = f"{s}{ep:02d}{ext}"
+                        new_path = os.path.join(season_path, new_name)
+                        if new_name != fname and not os.path.exists(new_path):
+                            os.rename(fpath, new_path)
+                            log(f"✏️  {show}/Season {snum}/{fname}  →  {new_name}")
+                            count += 1
+                    else:
+                        log(f"⚠ Could not parse: {show}/Season {snum}/{fname}")
+
+            # ── Case 2: Video file sitting loose in the show folder ───────────
+            elif os.path.isfile(item_path):
+                ext = os.path.splitext(item)[1].lower()
                 if ext not in VIDEO_EXT: continue
-                # Check if already correctly named (e.g. 101.mkv)
-                if re.match(r'^\d{3,4}' + re.escape(ext) + '$', fname): continue
-                # Try to parse episode number from filename
-                result = parse_episode(fname) or parse_episode(f"{show} {fname}")
+                result = parse_episode(item) or parse_episode(f"{show} {item}")
                 if result:
-                    _, _, ep = result
-                    new_name = f"{snum}{ep:02d}{ext}"
-                    new_path = os.path.join(season_path, new_name)
-                    if new_path != fpath and not os.path.exists(new_path):
-                        os.rename(fpath, new_path)
-                        log(f"✏️  {show}/Season {snum}/{fname}  →  {new_name}")
+                    _, season, ep = result
+                    s = season if season else 1
+                    dest_dir = os.path.join(show_path, f"Season {s}")
+                    os.makedirs(dest_dir, exist_ok=True)
+                    new_name = f"{s}{ep:02d}{ext}"
+                    new_path = os.path.join(dest_dir, new_name)
+                    if not os.path.exists(new_path):
+                        shutil.move(item_path, new_path)
+                        log(f"✏️  {show}/{item}  →  Season {s}/{new_name}")
                         count += 1
-    log(f"── Series scan done ({count} file(s) renamed) ──\n")
+                else:
+                    # No episode info — move to Unsorted
+                    dest_dir = os.path.join(show_path, "Unsorted")
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dest_path = os.path.join(dest_dir, item)
+                    if not os.path.exists(dest_path):
+                        shutil.move(item_path, dest_path)
+                        log(f"📂 {show}/{item}  →  Unsorted/")
+                        count += 1
+
+    log(f"── Series scan done ({count} file(s) processed) ──\n")
+
 
 def scan_movies_output(movie_dir, log):
-    """Walk the movies output folder and clean up any poorly named files."""
+    """Walk movies output folder. Handles:
+    - Movies in subfolders — move to root and rename
+    - Files with quality tags — clean and rename
+    - All video files — always attempt clean rename (not just ones with quality tags)
+    """
     if not movie_dir or not os.path.isdir(movie_dir):
         log("⚠ Movies output folder not set or doesn't exist."); return
     count = 0
-    for fname in os.listdir(movie_dir):
-        fpath = os.path.join(movie_dir, fname)
-        # Flatten subfolders — move video files up to root
-        if os.path.isdir(fpath):
-            for sub in os.listdir(fpath):
-                sub_path = os.path.join(fpath, sub)
-                ext = os.path.splitext(sub)[1].lower()
-                if os.path.isfile(sub_path) and ext in VIDEO_EXT:
-                    dest = os.path.join(movie_dir, sub)
-                    if not os.path.exists(dest):
-                        shutil.move(sub_path, dest)
-                        log(f"📁 Moved out of subfolder: {sub}")
-                        count += 1
-            try:
-                if not os.listdir(fpath): os.rmdir(fpath)
-            except: pass
-            continue
-        if not os.path.isfile(fpath): continue
-        ext = os.path.splitext(fname)[1].lower()
-        if ext not in VIDEO_EXT: continue
-        # Check if file has quality tags still in the name
-        if not QUALITY_TAG.search(fname): continue
-        raw_title, raw_year = clean_movie_name(fname)
-        # Try TMDB if enabled, otherwise just clean the name
-        tmdb = tmdb_lookup(raw_title, raw_year)
-        if tmdb:
-            title, year = tmdb
-            log(f"🌐 TMDB: '{raw_title}' → '{title}' ({year})")
-        else:
-            title, year = raw_title, raw_year
-        new_name = build_movie_filename(title, year, ext)
-        new_path = os.path.join(movie_dir, new_name)
-        if new_name != fname and not os.path.exists(new_path):
-            os.rename(fpath, new_path)
-            log(f"✏️  {fname}  →  {new_name}")
-            count += 1
-    log(f"── Movies scan done ({count} file(s) renamed) ──\n")
+
+    # Process recursively — handle subfolders first
+    def _process_dir(folder, depth=0):
+        nonlocal count
+        if depth > 3: return  # safety limit
+        try:
+            items = list(os.listdir(folder))
+        except Exception:
+            return
+
+        for fname in items:
+            fpath = os.path.join(folder, fname)
+
+            if os.path.isdir(fpath):
+                # Recurse into subfolder first
+                _process_dir(fpath, depth + 1)
+                # After processing, move any remaining video files to movie_dir root
+                try:
+                    for sub in list(os.listdir(fpath)):
+                        sub_path = os.path.join(fpath, sub)
+                        ext2 = os.path.splitext(sub)[1].lower()
+                        if os.path.isfile(sub_path) and ext2 in VIDEO_EXT:
+                            # Clean and rename before moving to root
+                            raw_title, raw_year = clean_movie_name(sub)
+                            tmdb = tmdb_lookup(raw_title, raw_year)
+                            if tmdb:
+                                title, year = tmdb
+                                log(f"🌐 TMDB: '{raw_title}' → '{title}' ({year})")
+                            else:
+                                title, year = raw_title, raw_year
+                            new_name = build_movie_filename(title, year, ext2)
+                            dest = os.path.join(movie_dir, new_name)
+                            # avoid overwrite
+                            base, ex = os.path.splitext(new_name)
+                            c = 1
+                            while os.path.exists(dest):
+                                dest = os.path.join(movie_dir, f"{base}_{c}{ex}")
+                                c += 1
+                            shutil.move(sub_path, dest)
+                            log(f"📁 {fname}/{sub}  →  {os.path.basename(dest)}")
+                            count += 1
+                    # Remove empty subfolder
+                    if not os.listdir(fpath):
+                        os.rmdir(fpath)
+                except Exception as e:
+                    log(f"⚠ Error processing folder {fname}: {e}")
+                continue
+
+            # It's a file at root level
+            if not os.path.isfile(fpath): continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in VIDEO_EXT: continue
+
+            # Always clean the name — remove quality tags, fix capitalisation
+            raw_title, raw_year = clean_movie_name(fname)
+            tmdb = tmdb_lookup(raw_title, raw_year)
+            if tmdb:
+                title, year = tmdb
+                log(f"🌐 TMDB: '{raw_title}' → '{title}' ({year})")
+            else:
+                title, year = raw_title, raw_year
+
+            new_name = build_movie_filename(title, year, ext)
+            new_path = os.path.join(movie_dir, new_name)
+
+            if new_name == fname:
+                continue  # already correct
+
+            if not os.path.exists(new_path):
+                os.rename(fpath, new_path)
+                log(f"✏️  {fname}  →  {new_name}")
+                count += 1
+            else:
+                log(f"⚠ Skipped (already exists): {new_name}")
+
+    _process_dir(movie_dir)
+    log(f"── Movies scan done ({count} file(s) processed) ──\n")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WATCHDOG HANDLER
